@@ -219,6 +219,9 @@ func fillWidth(s string, width int) string {
 		return ""
 	}
 	w := cellWidth(s)
+	if w == width {
+		return s
+	}
 	if w > width {
 		s = truncateToWidth(s, width)
 		w = cellWidth(s)

@@ -11,20 +11,25 @@ import (
 
 // stripAnsi removes ANSI escape sequences from a string.
 func stripAnsi(s string) string {
+	if strings.IndexByte(s, 0x1b) == -1 {
+		return s
+	}
 	var b strings.Builder
+	b.Grow(len(s))
 	inEscape := false
-	for _, r := range s {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
 		if inEscape {
-			if r == 'm' || r == 'K' || r == 'H' || r == 'J' {
+			if escapeFinal(rune(c)) {
 				inEscape = false
 			}
 			continue
 		}
-		if r == 0x1b {
+		if c == 0x1b {
 			inEscape = true
 			continue
 		}
-		b.WriteRune(r)
+		b.WriteByte(c)
 	}
 	return b.String()
 }
@@ -190,6 +195,17 @@ func cellWidth(s string) int {
 		return len(s)
 	}
 	plain := stripEscapes(s)
+	isPlainASCII := true
+	for i := 0; i < len(plain); i++ {
+		b := plain[i]
+		if b < 0x20 || b > 0x7e {
+			isPlainASCII = false
+			break
+		}
+	}
+	if isPlainASCII {
+		return len(plain)
+	}
 	width, lineWidth, state := 0, 0, -1
 	for len(plain) > 0 {
 		var cluster string
