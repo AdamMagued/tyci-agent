@@ -22,7 +22,7 @@ func (w *multiWaiter) Wait(ctx context.Context, id string, timeout time.Duration
 	if !ok {
 		return JobStatus{}, false
 	}
-	if !st.Done && !st.Waiting {
+	if !st.Done {
 		select {
 		case <-ctx.Done():
 		case <-time.After(timeout):

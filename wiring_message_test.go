@@ -68,11 +68,11 @@ func TestWiring_M1_MessagePostedWhileRunningReachesNextIteration(t *testing.T) {
 		if !ok {
 			t.Fatal("job vanished from registry")
 		}
-		if j.Status == jobs.StatusWaitingAnswer {
+		if j.Status == jobs.StatusRunning {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for job to reach waiting_answer, last status: %s", j.Status)
+			t.Fatalf("timed out waiting for job to run, last status: %s", j.Status)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -84,10 +84,6 @@ func TestWiring_M1_MessagePostedWhileRunningReachesNextIteration(t *testing.T) {
 	// "message" tool / "/msg" slash command actually do before posting.
 	if _, ok := reg.Resolve("#" + jobs.ShortID(jobID)); !ok {
 		t.Fatalf("expected Resolve to find job %s via its short id", jobID)
-	}
-
-	if !reg.Answer(jobID, "yes", true) {
-		t.Fatal("expected Answer to succeed against a job currently waiting")
 	}
 
 	final, ok := reg.Wait(context.Background(), jobID, 2*time.Second)

@@ -76,16 +76,6 @@ type raceJobHandle struct{}
 
 func (raceJobHandle) ID() string { return "race-job" }
 
-type raceJobAsker struct{}
-
-func (raceJobAsker) Ask(ctx context.Context, id, question string) (string, bool, bool) {
-	return "", false, false
-}
-
-type raceJobAnswerer struct{}
-
-func (raceJobAnswerer) Answer(id, text string, fromUser bool) bool { return false }
-
 type raceJobProgressReporter struct{}
 
 func (raceJobProgressReporter) SetProgress(id, text string) bool { return false }
@@ -202,8 +192,7 @@ func runConcurrentSetGet(t *testing.T, set func(), get func()) {
 // TestJobGlobals_ConcurrentSetGet_RaceFree is table-driven over the seven
 // globals B2 covers, one subtest per global, each hammering its SetXxx
 // against its read path (the accessor every real call site now goes
-// through — see e.g. tools/subagent.go's getJobStarter, tools/ask.go's
-// getJobAsker/getJobAnswerer).
+// through — see e.g. tools/subagent.go's getJobStarter).
 func TestJobGlobals_ConcurrentSetGet_RaceFree(t *testing.T) {
 	// F26: RESTORE what was there, do not blank it. An unconditional
 	// SetXxx(nil) on cleanup would destroy any outer wiring a caller running
@@ -215,8 +204,6 @@ func TestJobGlobals_ConcurrentSetGet_RaceFree(t *testing.T) {
 	oldActivityToucher := jobActivityToucher
 	jobActivityToucherMu.RUnlock()
 	oldStarter := getJobStarter()
-	oldAsker := getJobAsker()
-	oldAnswerer := getJobAnswerer()
 	oldProgressReporter := getJobProgressReporter()
 	oldProgressHeartbeat := getJobProgressHeartbeat()
 	oldMailbox := getJobMailbox()
@@ -227,8 +214,6 @@ func TestJobGlobals_ConcurrentSetGet_RaceFree(t *testing.T) {
 	oldPromoter := getJobPromoter()
 	t.Cleanup(func() {
 		SetJobStarter(oldStarter)
-		SetJobAsker(oldAsker)
-		SetJobAnswerer(oldAnswerer)
 		SetJobProgressReporter(oldProgressReporter)
 		SetJobProgressHeartbeat(oldProgressHeartbeat)
 		SetJobMailbox(oldMailbox)
@@ -249,16 +234,6 @@ func TestJobGlobals_ConcurrentSetGet_RaceFree(t *testing.T) {
 			name: "jobStarter",
 			set:  func() { SetJobStarter(raceJobStarter{}) },
 			get:  func() { _ = getJobStarter() },
-		},
-		{
-			name: "jobAsker",
-			set:  func() { SetJobAsker(raceJobAsker{}) },
-			get:  func() { _ = getJobAsker() },
-		},
-		{
-			name: "jobAnswerer",
-			set:  func() { SetJobAnswerer(raceJobAnswerer{}) },
-			get:  func() { _ = getJobAnswerer() },
 		},
 		{
 			name: "jobProgressReporter",

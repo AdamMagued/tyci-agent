@@ -408,6 +408,7 @@ func builtinToolsSchema() []map[string]any {
 						"ids":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Ids of background jobs to wait on. Repeats are ignored."},
 						"mode":    map[string]any{"type": "string", "enum": []string{"any", "all"}, "description": "any (default): return when the first job finishes or blocks. all: return when every job does."},
 						"note":    map[string]any{"type": "string", "description": "Optional note describing what you're waiting for, echoed back for context."},
+						"kinds":   map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"ask.reply"}}, "description": "Only \"ask.reply\": the wait is for the answer to a question you asked with ask_parent. The wait also ends early on any other new notice."},
 					},
 					"required": []string{"seconds"},
 				},
@@ -575,7 +576,7 @@ func builtinToolsSchema() []map[string]any {
 			"type": "function",
 			"function": map[string]any{
 				"name":        "ask_parent",
-				"description": "Ask your parent — whoever spawned this job: a human at the keyboard, another agent, or (if no handoff back to either is available) nobody reachable at all, in which case this fails immediately instead of blocking uselessly — one question, and BLOCK until it answers. Only usable inside a job (any subagent call, or a /btw side-conversation). While waiting you make zero progress, and if the wall clock runs out first your whole run is discarded. A last resort for genuine ambiguity: prefer stating an assumption and proceeding.",
+				"description": "Ask your parent — whoever spawned this job: a human at the keyboard or another agent — one question. It does not block: it returns at once with a question id (q<N>), and the answer arrives later as a notice with that id. Call wait(kinds=[\"ask.reply\"]) only when you cannot continue without the answer. Only usable inside a job (any subagent call, or a /btw side-conversation). A last resort for genuine ambiguity: prefer stating an assumption and proceeding.",
 				"parameters": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -589,7 +590,7 @@ func builtinToolsSchema() []map[string]any {
 			"type": "function",
 			"function": map[string]any{
 				"name":        "answer_job",
-				"description": "Relay a REAL answer to a specific job that is blocked on ask_parent, by its job_id — either something you genuinely already know, or something the human actually said. For a timeout extension request, use action=\"extension\" with request_id and approve instead. Never invent an answer standing in for a human who has not actually replied. Urgent the moment you are told a job is waiting: it makes no progress meanwhile and everything it has done is discarded if it times out unanswered.",
+				"description": "Relay a REAL answer to a question from a child job, by its question id (q<N>, from the notice) — either something you genuinely already know, or something the human actually said. For a timeout extension request, use action=\"extension\" with request_id and approve instead. Never invent an answer standing in for a human who has not actually replied. Urgent the moment you are told a job has asked: the child needs this answer to finish the work that depends on it.",
 				"parameters": map[string]any{
 					"type": "object",
 					"properties": map[string]any{

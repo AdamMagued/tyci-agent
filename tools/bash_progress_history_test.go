@@ -136,8 +136,6 @@ func (a regJobWaiterForBashTest) Wait(ctx context.Context, id string, timeout ti
 		Success:                  job.Status == jobs.StatusDone || job.Status == jobs.StatusTruncated,
 		Content:                  job.Result,
 		Error:                    job.Err,
-		Waiting:                  job.Status == jobs.StatusWaitingAnswer,
-		Question:                 job.Question,
 		Progress:                 job.Progress,
 		ProgressHistory:          job.ProgressHistory,
 		ProgressHistoryTruncated: job.ProgressHistoryTruncated,

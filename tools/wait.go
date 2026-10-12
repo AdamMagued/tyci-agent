@@ -48,20 +48,6 @@ type JobStatus struct {
 	Success bool
 	Content string
 	Error   string
-	// Waiting is true when the job is currently blocked inside an
-	// "ask_parent" tool call, waiting for someone to call "answer_job" on
-	// it. Only meaningful when Done is false.
-	Waiting bool
-	// Question is the pending question text while Waiting is true.
-	Question string
-	// QuestionSeq is the ask that produced Question (jobs.Job.QuestionSeq
-	// mirrored) — an unforgeable per-ask id, unlike Question itself, which
-	// is free text a job can pose identically more than once across its
-	// lifetime. handOff's pendingQuestions peek uses this, not Question
-	// text, to key JobNotifier.MarkAskShown so the "already shown"
-	// mark from one ask can never be mistaken for covering a later,
-	// identically-worded one (item 54 review finding 1).
-	QuestionSeq int
 	// Progress is the last status note recorded for the job, if any —
 	// either an explicit "report_progress" call, or (the dominant source in
 	// practice) one throttled line of a backgrounded shell command's own
@@ -142,6 +128,40 @@ func (t *WaitTool) setWaiter(w JobWaiter) {
 	t.waiterMu.Unlock()
 }
 
+// waitKinds reads the optional "kinds" input. Only "ask.reply" is accepted.
+// The wait wakes on any new notice, so this input does not yet filter
+// notices by kind (see the tool schema in tool.go).
+func waitKinds(input map[string]any) (kinds []string, errText string) {
+	raw, ok := input["kinds"]
+	if !ok {
+		return nil, ""
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		if sl, isStrings := raw.([]string); isStrings {
+			return sl, validateWaitKinds(sl)
+		}
+		return nil, "kinds must be an array of strings"
+	}
+	for _, v := range list {
+		s, ok := v.(string)
+		if !ok {
+			return nil, "kinds must contain only strings"
+		}
+		kinds = append(kinds, s)
+	}
+	return kinds, validateWaitKinds(kinds)
+}
+
+func validateWaitKinds(kinds []string) string {
+	for _, k := range kinds {
+		if k != "ask.reply" {
+			return fmt.Sprintf("kinds: unknown kind %q, the only allowed kind is \"ask.reply\"", k)
+		}
+	}
+	return ""
+}
+
 func (t *WaitTool) Run(ctx context.Context, input map[string]any) ToolResult {
 	jobID, _ := input["job_id"].(string)
 	ids, multi, idsErr := waitIDs(input)
@@ -155,6 +175,10 @@ func (t *WaitTool) Run(ctx context.Context, input map[string]any) ToolResult {
 	if mode != "any" && mode != "all" {
 		return validationResultf("mode must be \"any\" or \"all\", got %q", mode)
 	}
+	kinds, errText := waitKinds(input)
+	if errText != "" {
+		return validationResult(errText)
+	}
 
 	// A wait blocks without streaming, so the watchdog would read the caller
 	// as idle. Its return counts as activity for the caller's own job.
@@ -163,8 +187,9 @@ func (t *WaitTool) Run(ctx context.Context, input map[string]any) ToolResult {
 
 	secRaw, hasSeconds := input["seconds"]
 	isJob := jobID != "" || len(ids) > 0
-	if !hasSeconds && !isJob {
-		return validationResult("seconds is required for a plain wait (or pass job_id or ids to wait for a job)")
+	// kinds alone waits for a notice of those kinds, with the default time.
+	if !hasSeconds && !isJob && len(kinds) == 0 {
+		return validationResult("seconds is required for a plain wait (or pass job_id, ids or kinds)")
 	}
 	seconds := DefaultJobWaitSeconds
 	if hasSeconds {
@@ -248,13 +273,6 @@ func (t *WaitTool) Run(ctx context.Context, input map[string]any) ToolResult {
 				return ToolResult{Type: "result", Success: true, Content: "job finished: " + status.Content + clampedNote}
 			}
 			return ToolResult{Type: "result", Success: false, Error: status.Error}
-		}
-		if status.Waiting {
-			return ToolResult{
-				Type:    "result",
-				Success: true,
-				Content: fmt.Sprintf("job %s is waiting for an answer: %q. Relay it to the user (or genuinely-known info) unless you truly know the answer — call the \"answer_job\" tool with job_id=%q and that reply to unblock it. Never invent an answer standing in for a human who hasn't replied.%s", jobID, status.Question, jobID, clampedNote),
-			}
 		}
 		// Show the whole retained sequence, not just the latest note: a
 		// job that reported several times (a backgrounded shell command's
@@ -501,7 +519,7 @@ func (t *WaitTool) waitForJob(ctx context.Context, waiter JobWaiter, jobID strin
 		if !ok {
 			return status, false, false, false
 		}
-		if status.Done || status.Waiting {
+		if status.Done {
 			return status, true, false, false
 		}
 		if ctx.Err() != nil {

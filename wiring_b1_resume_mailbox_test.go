@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -61,11 +62,21 @@ func parseResumeJobID(content string) (string, error) {
 	return out.JobID, nil
 }
 
-// waitForWaitingAnswer polls reg until id is StatusWaitingAnswer, failing
-// the test on timeout — mirroring the M1 test's identical wait loop, the
-// deterministic point at which posting to that job's mailbox is guaranteed
-// to be observed at its next iteration boundary.
-func waitForWaitingAnswer(t *testing.T, reg *jobs.Registry, id string) {
+// b1Gate returns a channel the fake child waits on before its resumed turn
+// returns, and a release func that is safe to call more than once. The
+// child stays running until the test posts its steering message, so the
+// message is guaranteed to be drained at the next iteration boundary.
+func b1Gate(t *testing.T) (<-chan struct{}, func()) {
+	ch := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(ch) }) }
+	t.Cleanup(release)
+	return ch, release
+}
+
+// waitForRunning polls reg until id is StatusRunning, failing the test on
+// timeout — mirroring the M1 test's identical wait loop.
+func waitForRunning(t *testing.T, reg *jobs.Registry, id string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -73,11 +84,11 @@ func waitForWaitingAnswer(t *testing.T, reg *jobs.Registry, id string) {
 		if !ok {
 			t.Fatalf("job %s vanished from registry", id)
 		}
-		if j.Status == jobs.StatusWaitingAnswer {
+		if j.Status == jobs.StatusRunning {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for job %s to reach waiting_answer, last status: %s", id, j.Status)
+			t.Fatalf("timed out waiting for job %s to run, last status: %s", id, j.Status)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -90,6 +101,7 @@ func waitForWaitingAnswer(t *testing.T, reg *jobs.Registry, id string) {
 func TestWiring_B1_ResumedJobMailboxBoundToNewJobID(t *testing.T) {
 	reg, _ := withTestWiring(t)
 
+	gate, release := b1Gate(t)
 	childFake := &connectortest.Fake{ProviderName: "b1-child"}
 	childFake.Script = func(turn int, req connector.Request) []stream.Event {
 		switch turn {
@@ -100,9 +112,9 @@ func TestWiring_B1_ResumedJobMailboxBoundToNewJobID(t *testing.T) {
 				stream.Finish{Reason: "stop"},
 			}
 		case 1:
-			// The resumed run's first turn: block in ask_parent so the test
-			// can deterministically post to the NEW job's mailbox before
-			// releasing it, exactly like TestWiring_M1's synchronization.
+			// The resumed run's first turn: wait until the test has posted to
+			// the NEW job's mailbox, then ask_parent. The ask returns at once.
+			<-gate
 			return []stream.Event{
 				stream.ToolCall{ID: "ask-resumed", Name: "ask_parent", Arguments: `{"question":"proceed?"}`},
 				stream.Finish{Reason: "tool_calls"},
@@ -150,7 +162,7 @@ func TestWiring_B1_ResumedJobMailboxBoundToNewJobID(t *testing.T) {
 		t.Fatalf("expected a new, distinct job id from resume, got the original back")
 	}
 
-	waitForWaitingAnswer(t, reg, newJobID)
+	waitForRunning(t, reg, newJobID)
 
 	// Post to the NEW job's id — the one the model was actually given.
 	msgRes := tools.RunTool(context.Background(), "message", map[string]any{
@@ -160,9 +172,7 @@ func TestWiring_B1_ResumedJobMailboxBoundToNewJobID(t *testing.T) {
 		t.Fatalf("message: %s", msgRes.Error)
 	}
 
-	if !reg.Answer(newJobID, "go ahead", true) {
-		t.Fatal("expected Answer to succeed against a job currently waiting")
-	}
+	release()
 
 	final, ok := reg.Wait(context.Background(), newJobID, 2*time.Second)
 	if !ok {
@@ -185,6 +195,7 @@ func TestWiring_B1_ResumedJobMailboxBoundToNewJobID(t *testing.T) {
 func TestWiring_B1_ChainedResumeMailboxBoundToNewestJobID(t *testing.T) {
 	reg, _ := withTestWiring(t)
 
+	gate, release := b1Gate(t)
 	childFake := &connectortest.Fake{ProviderName: "b1-chain-child"}
 	childFake.Script = func(turn int, req connector.Request) []stream.Event {
 		switch turn {
@@ -202,7 +213,8 @@ func TestWiring_B1_ChainedResumeMailboxBoundToNewestJobID(t *testing.T) {
 				stream.Finish{Reason: "stop"},
 			}
 		case 2:
-			// Second resume (hop 2): block in ask_parent.
+			// Second resume (hop 2): wait for the steer, then ask_parent.
+			<-gate
 			return []stream.Event{
 				stream.ToolCall{ID: "ask-hop2", Name: "ask_parent", Arguments: `{"question":"proceed?"}`},
 				stream.Finish{Reason: "tool_calls"},
@@ -252,7 +264,7 @@ func TestWiring_B1_ChainedResumeMailboxBoundToNewestJobID(t *testing.T) {
 		t.Fatalf("expected a third distinct job id, got %q (hop0=%q hop1=%q)", jobID2, jobID0, jobID1)
 	}
 
-	waitForWaitingAnswer(t, reg, jobID2)
+	waitForRunning(t, reg, jobID2)
 
 	msgRes := tools.RunTool(context.Background(), "message", map[string]any{
 		"job_id": jobID2, "text": "steer hop two",
@@ -260,9 +272,7 @@ func TestWiring_B1_ChainedResumeMailboxBoundToNewestJobID(t *testing.T) {
 	if !msgRes.Success {
 		t.Fatalf("message to hop2: %s", msgRes.Error)
 	}
-	if !reg.Answer(jobID2, "go ahead", true) {
-		t.Fatal("expected Answer to succeed against hop2, which is waiting")
-	}
+	release()
 
 	final, ok := reg.Wait(context.Background(), jobID2, 2*time.Second)
 	if !ok {
@@ -287,6 +297,7 @@ func TestWiring_B1_ChainedResumeMailboxBoundToNewestJobID(t *testing.T) {
 func TestWiring_B1_ConcurrentResumesOfSameJobDoNotCrossTalk(t *testing.T) {
 	reg, _ := withTestWiring(t)
 
+	gate, release := b1Gate(t)
 	childFake := &connectortest.Fake{ProviderName: "b1-dual-child"}
 	childFake.Script = func(turn int, req connector.Request) []stream.Event {
 		if turn == 0 {
@@ -302,6 +313,7 @@ func TestWiring_B1_ConcurrentResumesOfSameJobDoNotCrossTalk(t *testing.T) {
 		// is that run's first turn (block in ask_parent); once answered,
 		// decide by which steer marker (if any) the mailbox drain appended.
 		if lastToolResultText(req) == "" {
+			<-gate
 			return []stream.Event{
 				stream.ToolCall{ID: fmt.Sprintf("ask-%d", turn), Name: "ask_parent", Arguments: `{"question":"proceed?"}`},
 				stream.Finish{Reason: "tool_calls"},
@@ -374,8 +386,8 @@ func TestWiring_B1_ConcurrentResumesOfSameJobDoNotCrossTalk(t *testing.T) {
 		t.Fatalf("expected two distinct resumed job ids, got the same one twice: %q", jobA)
 	}
 
-	waitForWaitingAnswer(t, reg, jobA)
-	waitForWaitingAnswer(t, reg, jobB)
+	waitForRunning(t, reg, jobA)
+	waitForRunning(t, reg, jobB)
 
 	if res := tools.RunTool(context.Background(), "message", map[string]any{"job_id": jobA, "text": "steerA"}); !res.Success {
 		t.Fatalf("message to A: %s", res.Error)
@@ -383,12 +395,7 @@ func TestWiring_B1_ConcurrentResumesOfSameJobDoNotCrossTalk(t *testing.T) {
 	if res := tools.RunTool(context.Background(), "message", map[string]any{"job_id": jobB, "text": "steerB"}); !res.Success {
 		t.Fatalf("message to B: %s", res.Error)
 	}
-	if !reg.Answer(jobA, "ok", true) {
-		t.Fatal("expected Answer to succeed against A")
-	}
-	if !reg.Answer(jobB, "ok", true) {
-		t.Fatal("expected Answer to succeed against B")
-	}
+	release()
 
 	finalA, ok := reg.Wait(context.Background(), jobA, 2*time.Second)
 	if !ok || finalA.Status != jobs.StatusDone {

@@ -99,7 +99,7 @@ func NewDispatcher(b *bus.Bus, self bus.Addr, tools ToolsConfig) *Dispatcher {
 	}
 	sub := b.Subscribe("tool-results", bus.Filter{
 		To:    self,
-		Kinds: []bus.Kind{bus.KindToolResult, bus.KindAgentMessage, bus.KindAskRequest, bus.KindPingMissed},
+		Kinds: []bus.Kind{bus.KindToolResult, bus.KindAgentMessage, bus.KindAskRequest, bus.KindAskReply, bus.KindPingMissed},
 	})
 	d := newDispatcher(b, self, sub)
 	d.tools = tools
@@ -515,7 +515,7 @@ func (d *Dispatcher) waitLate(ctx context.Context) []bus.ToolResult {
 // through the done channel.
 func wakesInline(msg bus.Message) bool {
 	switch msg.Kind {
-	case bus.KindToolResult, bus.KindAgentMessage, bus.KindAskRequest, bus.KindPingMissed:
+	case bus.KindToolResult, bus.KindAgentMessage, bus.KindAskRequest, bus.KindAskReply, bus.KindPingMissed:
 		return true
 	}
 	return false
@@ -541,9 +541,10 @@ var fastTools = map[string]bool{
 // cfg.BackgroundAfterSec, then the class value (fast or slow), then the
 // built-in default of the class.
 //
-// subagent, ask_parent and wait block by design: the model waits for the
-// answer or the child result, so they never background (noDeadline, see
-// Await). Their overrides and class values are ignored.
+// subagent and wait block by design: the model waits for the child result
+// or the awaited kinds, so they never background (noDeadline, see Await).
+// ask_parent returns at once, but it is kept in the same case because it
+// never backgrounds either. Their overrides and class values are ignored.
 //
 // This wait is not a kill deadline. A tool keeps its own timeout in
 // runToolCall, which does not change here.

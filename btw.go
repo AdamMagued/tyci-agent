@@ -40,46 +40,10 @@ func (a jobWaiterAdapter) Wait(ctx context.Context, id string, timeout time.Dura
 	}
 	return tools.JobStatus{
 		ID:                       job.ID,
-		Done:                     job.Status != jobs.StatusRunning && job.Status != jobs.StatusWaitingAnswer,
+		Done:                     job.Status != jobs.StatusRunning,
 		Success:                  job.Status == jobs.StatusDone || job.Status == jobs.StatusTruncated,
 		Content:                  job.Result,
 		Error:                    job.Err,
-		Waiting:                  job.Status == jobs.StatusWaitingAnswer,
-		Question:                 job.Question,
-		QuestionSeq:              job.QuestionSeq,
-		Progress:                 job.Progress,
-		ProgressHistory:          job.ProgressHistory,
-		ProgressHistoryTruncated: job.ProgressHistoryTruncated,
-	}, true
-}
-
-// jobObserverAdapter satisfies tools.JobObserver over JobRegistry — same
-// translation as jobWaiterAdapter above, but calling WaitObserve instead of
-// Wait, and via a distinctly-named Observe method (batch-2 review round 2
-// finding D1) so this adapter can never be handed to SetJobObserver by
-// mistake in place of jobWaiterAdapter — the two used to share the exact
-// same method signature, which is what let the original C1 mistake compile
-// silently. This is the one that matters for C1: runWithHandoff's watcher
-// (and its handoff-message peek) must not count as a "waiter" for
-// jobs.Job.QuestionHasWaiter's purposes, or Ask suppresses the onEvent
-// notice for a caller that was never going to report the question to
-// anyone. See jobs.Registry.WaitObserve's doc comment.
-type jobObserverAdapter struct{ reg *jobs.Registry }
-
-func (a jobObserverAdapter) Observe(ctx context.Context, id string, timeout time.Duration) (tools.JobStatus, bool) {
-	job, ok := a.reg.WaitObserve(ctx, id, timeout)
-	if !ok {
-		return tools.JobStatus{}, false
-	}
-	return tools.JobStatus{
-		ID:                       job.ID,
-		Done:                     job.Status != jobs.StatusRunning && job.Status != jobs.StatusWaitingAnswer,
-		Success:                  job.Status == jobs.StatusDone || job.Status == jobs.StatusTruncated,
-		Content:                  job.Result,
-		Error:                    job.Err,
-		Waiting:                  job.Status == jobs.StatusWaitingAnswer,
-		Question:                 job.Question,
-		QuestionSeq:              job.QuestionSeq,
 		Progress:                 job.Progress,
 		ProgressHistory:          job.ProgressHistory,
 		ProgressHistoryTruncated: job.ProgressHistoryTruncated,
@@ -102,11 +66,45 @@ func (a jobStarterAdapter) Start(ctx context.Context, description, kind, parentI
 	return jobHandleAdapter{a.reg.Start(ctx, description, jobs.Kind(kind), parentID, fn)}
 }
 
-// jobAskerAdapter satisfies tools.JobAsker over JobRegistry.
+// askRoutes maps a question id (the Seq of its ask.request) to the job that
+// asked it, so an answer can be sent back to that job. It is in memory only:
+// after a restart the ask.request is still in the journal, but its id no
+// longer routes, and answer_job returns an error for it.
+var askRoutes = struct {
+	sync.Mutex
+	asker map[uint64]string
+}{asker: make(map[uint64]string)}
+
+// jobAskerAdapter satisfies tools.JobAsker: it publishes the question of job
+// id to the job's parent (the orchestrator when the parent is unknown) and
+// records which job asked it.
 type jobAskerAdapter struct{ reg *jobs.Registry }
 
-func (a jobAskerAdapter) Ask(ctx context.Context, id, question string) (string, bool, bool) {
-	return a.reg.Ask(ctx, id, question)
+func (a jobAskerAdapter) Ask(ctx context.Context, id, question string) (string, bool) {
+	j, ok := a.reg.Get(id)
+	if !ok {
+		return "", false
+	}
+	askRoutes.Lock()
+	defer askRoutes.Unlock()
+	pruneAskRoutes(a.reg)
+	seq, err := publishAsk(appBus, j.ParentID, id, question)
+	if err != nil {
+		fmt.Fprintf(busLog, "bus: ask from %s not published: %v\n", id, err)
+		return "", false
+	}
+	askRoutes.asker[seq] = id
+	return fmt.Sprintf("q%d", seq), true
+}
+
+// pruneAskRoutes drops the routes of jobs that are no longer running. Such a
+// job cannot receive the answer. The caller holds askRoutes.Lock.
+func pruneAskRoutes(reg *jobs.Registry) {
+	for seq, id := range askRoutes.asker {
+		if j, ok := reg.Get(id); !ok || (j.Status != jobs.StatusRunning && j.Status != jobs.StatusWaitingAnswer) {
+			delete(askRoutes.asker, seq)
+		}
+	}
 }
 
 // jobExtensionRequesterAdapter satisfies tools.JobExtensionRequester over
@@ -126,11 +124,38 @@ func (a jobExtensionRequesterAdapter) ResolveExtension(id, requestID string, app
 	return a.reg.ResolveExtension(id, requestID, approve)
 }
 
-// jobAnswererAdapter satisfies tools.JobAnswerer over JobRegistry.
+// jobAnswererAdapter satisfies tools.JobAnswerer: it sends an answer to the
+// job that asked question q<Seq> as an ask.reply message, once.
 type jobAnswererAdapter struct{ reg *jobs.Registry }
 
-func (a jobAnswererAdapter) Answer(id, text string, fromUser bool) bool {
-	return a.reg.Answer(id, text, fromUser)
+func (a jobAnswererAdapter) Answer(ctx context.Context, id, text string) error {
+	var seq uint64
+	if !strings.HasPrefix(id, "q") {
+		return fmt.Errorf("unknown question id %q: use the id q<N> that ask_parent returned", id)
+	}
+	if _, err := fmt.Sscanf(id, "q%d", &seq); err != nil {
+		return fmt.Errorf("unknown question id %q: use the id q<N> that ask_parent returned", id)
+	}
+	// The lock stays held until the route is dropped, so a failed publish
+	// keeps the route and the question can be answered again.
+	askRoutes.Lock()
+	defer askRoutes.Unlock()
+	asker, ok := askRoutes.asker[seq]
+	if !ok {
+		return fmt.Errorf("unknown or already answered question id %q", id)
+	}
+	// The answer comes from the agent that called answer_job: the orchestrator
+	// or a child job. The reply points at the question message.
+	from := orchestratorAddr
+	if caller, _ := ctx.Value(tools.JobIDCtxKey{}).(string); caller != "" {
+		from = agentAddr(caller)
+	}
+	if _, err := bus.PublishReply(appBus, bus.KindAskReply, from, agentAddr(asker), bus.OriginAgent,
+		seq, bus.AskReply{Question: id, Answer: text}); err != nil {
+		return fmt.Errorf("answer to %s not sent: %w", id, err)
+	}
+	delete(askRoutes.asker, seq)
+	return nil
 }
 
 // jobProgressAdapter satisfies tools.JobProgressReporter over JobRegistry.
@@ -680,7 +705,6 @@ func (s jobKindSource) Kind() string         { return string(s.j.Kind) }
 func (s jobKindSource) Status() string       { return string(s.j.Status) }
 func (s jobKindSource) Description() string  { return s.j.Description }
 func (s jobKindSource) StartedAt() time.Time { return s.j.StartedAt }
-func (s jobKindSource) Question() string     { return s.j.Question }
 
 // listJobsAdapter satisfies tools.JobLister over JobRegistry: kill_job's
 // inside-a-child subtree check walks this parentage.

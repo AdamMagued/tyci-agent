@@ -36,8 +36,6 @@ func printModeEnv(t *testing.T) (*jobs.Registry, *recordingNotifier) {
 	reg := jobs.NewRegistry(nil)
 	notifier := &recordingNotifier{}
 	SetJobStarter(testJobStarter{reg})
-	SetJobAsker(reg)
-	SetJobAnswerer(reg)
 	SetJobProgressReporter(reg)
 	SetJobNotifier(notifier)
 	SetBackgroundBashEnabled(false)
@@ -105,43 +103,6 @@ func TestPrintModeChildCanReportProgress(t *testing.T) {
 	}
 	if !reportRes.Success {
 		t.Fatalf("report_progress failed inside a print-mode child: %s", reportRes.Error)
-	}
-}
-
-// TestAskFailsFastWhenTheSpawningCallCannotHandOff is blocker (a) from
-// review: giving these children a job id must not make "ask_parent" pass its
-// job-id gate and then block for its whole timeout on the one path where an
-// answer can structurally never arrive (the "subagent" tool call here does
-// not return until the child itself finishes — there is no handoff to free
-// it up, and no drained notice either). It must fail immediately,
-// exactly as it did before this job id existed at all.
-func TestAskFailsFastWhenTheSpawningCallCannotHandOff(t *testing.T) {
-	_, _ = printModeEnv(t)
-	var askRes ToolResult
-	tool := &SubagentTool{Runner: &mockRunner{
-		RunTaskFunc: func(ctx context.Context, _, _ string, _ SubagentOptions) (string, error) {
-			askRes = (&AskTool{}).Run(ctx, map[string]any{"question": "what color?"})
-			return "done", nil
-		},
-	}}
-
-	done := make(chan struct{})
-	go func() {
-		tool.Run(ctxWithParentModel("test/model"), map[string]any{"task": "ask something"})
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("ask blocked instead of failing fast — nobody in this mode could ever answer it")
-	}
-
-	if askRes.Success {
-		t.Fatalf("expected ask to fail fast, got success: %+v", askRes)
-	}
-	if !strings.Contains(askRes.Error, "cannot get an answer") {
-		t.Fatalf("unexpected ask error: %q", askRes.Error)
 	}
 }
 

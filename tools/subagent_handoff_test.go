@@ -116,7 +116,7 @@ func TestHandoffEnvDrainsBeforeNotifierIsTornDown(t *testing.T) {
 			return "late", nil
 		})
 		st := tool.spawn(context.Background(), subagentTask{Task: "slow"}, false, true)
-		tool.handOff(context.Background(), []*spawnedTask{st}, true)
+		tool.handOff([]*spawnedTask{st})
 		close(release)
 		// Returned while the child is still on its way out.
 	})
@@ -180,7 +180,7 @@ func TestBlockingCallHandsOverASlowChild(t *testing.T) {
 	// Drive the private path with a short window rather than waiting 60s.
 	spawned := []*spawnedTask{tool.spawn(context.Background(), subagentTask{Task: "the slow one"}, false, true)}
 	time.Sleep(20 * time.Millisecond)
-	res := tool.handOff(context.Background(), spawned, true)
+	res := tool.handOff(spawned)
 
 	if !res.Success {
 		t.Fatalf("handoff failed: %s", res.Error)
@@ -243,7 +243,7 @@ func TestHandoffReportsChildrenThatAlreadyFinished(t *testing.T) {
 	quick := tool.spawn(context.Background(), subagentTask{Task: "quick one"}, false, true)
 	slow := tool.spawn(context.Background(), subagentTask{Task: "slow one"}, false, true)
 	<-quick.done
-	res := tool.handOff(context.Background(), []*spawnedTask{quick, slow}, true)
+	res := tool.handOff([]*spawnedTask{quick, slow})
 	// Let the handed-over child finish and wait for it: a job goroutine that
 	// outlives the test would still be notifying after cleanup tore the
 	// notifier down.
@@ -276,7 +276,7 @@ func TestHandoffOfASingleAlreadyFinishedTaskIsPlainText(t *testing.T) {
 	st := tool.spawn(context.Background(), subagentTask{Task: "quick"}, false, true)
 	<-st.done
 
-	res := tool.handOff(context.Background(), []*spawnedTask{st}, true)
+	res := tool.handOff([]*spawnedTask{st})
 	if !res.Success || res.Content != "the answer" {
 		t.Fatalf("expected plain text for a single already-finished task, got %+v", res)
 	}
@@ -326,7 +326,7 @@ func TestHandoffStopsStreamingIntoAClosedBlock(t *testing.T) {
 		t.Fatal("streaming should be on while the parent is still waiting")
 	}
 
-	tool.handOff(context.Background(), []*spawnedTask{st}, true)
+	tool.handOff([]*spawnedTask{st})
 	if !st.stopStream.Load() {
 		t.Fatal("streaming was not stopped at the handoff")
 	}
@@ -711,196 +711,4 @@ func TestBlockingCallHandsOffAtTimerExpiry(t *testing.T) {
 	if n := len(notifier.all()); n != 1 {
 		t.Fatalf("expected exactly one completion notice, got %d: %v", n, notifier.all())
 	}
-}
-
-// TestAskAnswerRoundTripWhenHandoffIsAvailable is review finding 2: nothing
-// pinned AskUnroutableCtxKey to ONLY the no-handoff path. It must NOT be set
-// for a blocking call in a mode where handoff is available (background bash
-// enabled, as the TUI does) — a child asking a question there can
-// genuinely be answered once the parent gets its turn back (via handoff, or
-// simply because the child finishes fast). This is that round trip: a child
-// blocks in "ask_parent", the test plays "the parent or the person watching" and
-// answers it directly against the real registry, and the child must
-// actually receive that answer rather than being told upfront that nothing
-// could ever answer it.
-func TestAskAnswerRoundTripWhenHandoffIsAvailable(t *testing.T) {
-	reg, _ := handoffEnv(t, time.Minute)
-	SetJobAsker(reg)
-	SetJobAnswerer(reg)
-	t.Cleanup(func() {
-		SetJobAsker(nil)
-		SetJobAnswerer(nil)
-	})
-
-	var askRes ToolResult
-	askDone := make(chan struct{})
-	tool := &SubagentTool{Runner: &mockRunner{
-		RunTaskFunc: func(ctx context.Context, _, _ string, _ SubagentOptions) (string, error) {
-			askRes = (&AskTool{}).Run(ctx, map[string]any{"question": "what color?"})
-			close(askDone)
-			return "done", nil
-		},
-	}}
-
-	resultCh := make(chan ToolResult, 1)
-	go func() {
-		resultCh <- tool.Run(ctxWithParentModel("test/model"), map[string]any{"task": "ask something"})
-	}()
-
-	// Find the child's job id once it is blocked waiting for an answer.
-	var jobID string
-	deadline := time.Now().Add(2 * time.Second)
-	for jobID == "" {
-		if time.Now().After(deadline) {
-			t.Fatal("child never reached waiting_answer")
-		}
-		for _, j := range reg.List() {
-			if j.Status == jobs.StatusWaitingAnswer {
-				jobID = j.ID
-			}
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	if !reg.Answer(jobID, "blue", true) {
-		t.Fatal("Answer failed against a job that should have been waiting")
-	}
-
-	select {
-	case <-askDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("ask never returned after being answered — AskUnroutableCtxKey must have leaked into a handoff-eligible call")
-	}
-	if !askRes.Success || askRes.Content != "blue" {
-		t.Fatalf("expected ask to receive the real answer, got: %+v", askRes)
-	}
-
-	select {
-	case res := <-resultCh:
-		if !res.Success {
-			t.Fatalf("subagent call failed: %s", res.Error)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("subagent call did not finish after the child was answered")
-	}
-}
-
-// --- Item 54: a child's question must not surface twice — once inline in
-// the handoff message's "question" field, once again as a separately queued
-// notice. handOff's markShown parameter controls whether it tells the wired
-// JobNotifier (MarkAskShown, see markAskShown in bus_wiring.go) that a question it just
-// put in the message was "shown" — these two tests pin both sides of that at
-// the handOff level, independent of the full onEvent wiring (which
-// wiring_ask_notice_dedup_test.go covers end to end).
-
-// TestHandoffMarksShownQuestionsWhenTrue is case (a): the handoff message
-// carries a still-running child's question, and markShown=true must report
-// exactly that job/question pair to the notifier — the signal
-// noticeCounter.MarkAskShown uses to suppress the duplicate onEvent
-// notice at drain time.
-func TestHandoffMarksShownQuestionsWhenTrue(t *testing.T) {
-	reg := jobs.NewRegistry(nil)
-	notifier := &recordingNotifier{}
-	SetJobStarter(testJobStarter{reg})
-	SetJobObserver(realJobObserver{reg})
-	SetJobNotifier(notifier)
-	t.Cleanup(func() {
-		SetJobStarter(nil)
-		SetJobObserver(nil)
-		SetJobNotifier(nil)
-	})
-
-	release := make(chan struct{})
-	tool := &SubagentTool{Runner: &mockRunner{
-		RunTaskFunc: func(ctx context.Context, _ string, _ string, _ SubagentOptions) (string, error) {
-			jobID, _ := ctx.Value(JobIDCtxKey{}).(string)
-			ans, _, _ := reg.Ask(ctx, jobID, "which branch?")
-			<-release
-			return "answer was: " + ans, nil
-		},
-	}}
-
-	st := tool.spawn(context.Background(), subagentTask{Task: "ask something"}, false, true)
-	// Wait for the child to actually be blocked on its question before
-	// handing off, the same deterministic handshake pendingQuestions'
-	// own tests use elsewhere in this file.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if job, ok := reg.WaitObserve(context.Background(), st.jobID, 0); ok && job.Status == jobs.StatusWaitingAnswer {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("child never reached waiting_answer")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	res := tool.handOff(context.Background(), []*spawnedTask{st}, true)
-	if !strings.Contains(res.Content, "which branch?") {
-		t.Fatalf("expected the handoff message to carry the question: %s", res.Content)
-	}
-	wantSeq, ok := reg.WaitObserve(context.Background(), st.jobID, 0)
-	if !ok {
-		t.Fatal("expected the job to still be known to the registry")
-	}
-	if seq, ok := notifier.shownFor(st.jobID); !ok || seq != wantSeq.QuestionSeq {
-		t.Fatalf("expected MarkAskShown(%q, %d), got shown=%v", st.jobID, wantSeq.QuestionSeq, notifier.shown)
-	}
-
-	reg.Answer(st.jobID, "main", true)
-	close(release)
-	<-st.done
-}
-
-// TestHandoffDoesNotMarkShownWhenFalse is case (c)'s handOff-level half: the
-// Esc/ctx.Done() path passes markShown=false because duplicating the queued
-// notice there costs far less than risking its only delivery — so it must
-// NOT tell the notifier the question was shown, leaving the already-queued
-// (production) ask-notice as
-// the only delivery.
-func TestHandoffDoesNotMarkShownWhenFalse(t *testing.T) {
-	reg := jobs.NewRegistry(nil)
-	notifier := &recordingNotifier{}
-	SetJobStarter(testJobStarter{reg})
-	SetJobObserver(realJobObserver{reg})
-	SetJobNotifier(notifier)
-	t.Cleanup(func() {
-		SetJobStarter(nil)
-		SetJobObserver(nil)
-		SetJobNotifier(nil)
-	})
-
-	release := make(chan struct{})
-	tool := &SubagentTool{Runner: &mockRunner{
-		RunTaskFunc: func(ctx context.Context, _ string, _ string, _ SubagentOptions) (string, error) {
-			jobID, _ := ctx.Value(JobIDCtxKey{}).(string)
-			ans, _, _ := reg.Ask(ctx, jobID, "which branch?")
-			<-release
-			return "answer was: " + ans, nil
-		},
-	}}
-
-	st := tool.spawn(context.Background(), subagentTask{Task: "ask something"}, false, true)
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if job, ok := reg.WaitObserve(context.Background(), st.jobID, 0); ok && job.Status == jobs.StatusWaitingAnswer {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("child never reached waiting_answer")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	res := tool.handOff(context.Background(), []*spawnedTask{st}, false)
-	if !strings.Contains(res.Content, "which branch?") {
-		t.Fatalf("expected the handoff message to still carry the question: %s", res.Content)
-	}
-	if seq, ok := notifier.shownFor(st.jobID); ok {
-		t.Fatalf("expected no MarkAskShown call with markShown=false, got %d", seq)
-	}
-
-	reg.Answer(st.jobID, "main", true)
-	close(release)
-	<-st.done
 }

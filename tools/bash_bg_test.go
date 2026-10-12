@@ -17,7 +17,7 @@ import (
 // reach the main conversation and records MarkAskShown calls (jobID -> seq),
 // so tests can assert whether handOff told the notifier a question was
 // already delivered via the handoff message — see subagent_handoff_test.go's
-// question-notice tests. Keyed on seq (jobs.Job.QuestionSeq), not question text.
+// question-notice tests. Keyed on seq (jobs.Job.question id), not question text.
 type recordingNotifier struct {
 	mu    sync.Mutex
 	seen  []string
@@ -59,13 +59,6 @@ func (n *recordingNotifier) all() []string {
 	out := make([]string, len(n.seen))
 	copy(out, n.seen)
 	return out
-}
-
-func (n *recordingNotifier) shownFor(jobID string) (int, bool) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	seq, ok := n.shown[jobID]
-	return seq, ok
 }
 
 // The three values every background-bash test here is built around: the two

@@ -344,7 +344,7 @@ func (w *scriptedWaiter) Wait(ctx context.Context, id string, timeout time.Durat
 	if !w.known {
 		return JobStatus{}, false
 	}
-	if !w.status.Done && !w.status.Waiting {
+	if !w.status.Done {
 		// Mimic the registry: block for the slice it was given.
 		w.mu.Unlock()
 		select {
@@ -429,40 +429,6 @@ func TestShortJobWaitIsRaised(t *testing.T) {
 	}
 	if !strings.Contains(res.Content, "raised to") {
 		t.Errorf("the caller should be told its duration was raised: %q", res.Content)
-	}
-}
-
-// TestWaitForJobStopsWhenItBlocksOnAQuestion: only the caller can answer, and
-// it cannot answer from inside this call — waiting on would strand both until
-// the timeout.
-func TestWaitForJobStopsWhenItBlocksOnAQuestion(t *testing.T) {
-	w := &scriptedWaiter{known: true}
-	tool := &WaitTool{Waiter: w}
-	go func() {
-		time.Sleep(150 * time.Millisecond)
-		w.set(JobStatus{Waiting: true, Question: "which branch?"})
-	}()
-
-	start := time.Now()
-	res := tool.Run(context.Background(), map[string]any{"job_id": "job-1", "seconds": 600})
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("waited %v on a job that was blocked on a question", elapsed)
-	}
-	if !strings.Contains(res.Content, "which branch?") {
-		t.Fatalf("got %q", res.Content)
-	}
-	// Item 29: this used to tell the model to "answer(job_id=..., text=...)"
-	// as if that were unconditionally the right move. It must now tell the
-	// model to relay to the user (or genuinely-known info) unless it truly
-	// knows the answer, and use the renamed tool.
-	if !strings.Contains(res.Content, "\"answer_job\"") {
-		t.Fatalf("expected the renamed answer_job tool to be named, got %q", res.Content)
-	}
-	if !strings.Contains(res.Content, "unless you truly know the answer") {
-		t.Fatalf("expected the nuanced relay-unless-you-know wording, got %q", res.Content)
-	}
-	if !strings.Contains(res.Content, "Never invent an answer standing in for a human who hasn't replied") {
-		t.Fatalf("expected the never-invent wording, got %q", res.Content)
 	}
 }
 

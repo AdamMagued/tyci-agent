@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,7 +71,7 @@ var orchestratorAddr = bus.Addr{Type: bus.AddrOrchestrator}
 // noticeKinds lists the kinds that an inbox or the orchestrator reads. A
 // subscription gets only the kinds it lists, so every consumer lists all of
 // them.
-var noticeKinds = []bus.Kind{bus.KindNoticeCompletion, bus.KindAskRequest, bus.KindBtwAnswer, bus.KindAgentMessage, bus.KindPingMissed}
+var noticeKinds = []bus.Kind{bus.KindNoticeCompletion, bus.KindAskRequest, bus.KindAskReply, bus.KindBtwAnswer, bus.KindAgentMessage, bus.KindPingMissed}
 
 // inboxSet keeps one Durable inbox subscription per agent. The inbox of an
 // agent opens when the job starts, before its ID is returned, and closes when
@@ -168,12 +169,13 @@ func publishNotice(b *bus.Bus, parentID, text string, quiet bool) {
 		bus.Completion{Text: text, Quiet: quiet})
 }
 
-// publishAsk sends the question of agent agentID to parentID, or to the
+// publishAsk sends question of agent agentID to parentID, or to the
 // orchestrator when parentID is "". The bus reroutes it to the orchestrator
-// when parentID has finished.
-func publishAsk(b *bus.Bus, parentID, agentID string, seq int, text string) {
-	publishTo(b, bus.KindAskRequest, agentAddr(agentID), recipientAddr(parentID), bus.OriginAgent,
-		bus.AskRequest{Agent: agentID, QuestionSeq: seq, Text: text})
+// when parentID has finished. It returns the bus Seq of the question, which
+// is the question id (q<Seq>).
+func publishAsk(b *bus.Bus, parentID, agentID, question string) (uint64, error) {
+	return bus.Publish(b, bus.KindAskRequest, agentAddr(agentID), recipientAddr(parentID), bus.OriginAgent,
+		bus.AskRequest{Agent: agentID, Question: question})
 }
 
 // publishBtwAnswer sends the answer of the /btw evaluation jobID to parentID,
@@ -199,54 +201,6 @@ func publishAgentMessage(b *bus.Bus, id string, from bus.Addr, origin bus.Origin
 	publishTo(b, bus.KindAgentMessage, from, agentAddr(id), origin, bus.AgentMessage{Text: text})
 }
 
-// maxShownAsks bounds the asks that a handoff message already carried. When
-// it is full, an arbitrary mark is dropped first.
-//
-// A mark is removed when a drain reaches its ask. A mark for an ask that a
-// drain already showed is never removed that way, so it stays until the
-// eviction. The eviction can then drop a live mark, and that can show one
-// question twice. The bound keeps the map small, and a duplicate is the only
-// effect. A question is never lost.
-const maxShownAsks = 64
-
-// askKey identifies one question of one agent.
-type askKey struct {
-	agent string
-	seq   int
-}
-
-var (
-	shownAsksMu sync.Mutex
-	shownAsks   = make(map[askKey]bool)
-)
-
-// markAskShown records that a handoff message carried question seq of agent.
-// The ask is left out of the next drain that reaches it, whether it was
-// published before or after this call.
-func markAskShown(agent string, seq int) {
-	shownAsksMu.Lock()
-	defer shownAsksMu.Unlock()
-	if len(shownAsks) >= maxShownAsks {
-		for k := range shownAsks {
-			delete(shownAsks, k)
-			break
-		}
-	}
-	shownAsks[askKey{agent, seq}] = true
-}
-
-// takeShownAsk reports whether the ask was marked, and clears the mark.
-func takeShownAsk(agent string, seq int) bool {
-	shownAsksMu.Lock()
-	defer shownAsksMu.Unlock()
-	k := askKey{agent, seq}
-	if !shownAsks[k] {
-		return false
-	}
-	delete(shownAsks, k)
-	return true
-}
-
 // formatNotices returns the text of each message that the model should read.
 // A message that the bus rerouted from a finished agent says so, and names
 // the agent.
@@ -259,6 +213,11 @@ func formatNotices(msgs []bus.Message) []string {
 		}
 		if m.OrigTo != nil {
 			text = fmt.Sprintf("[for agent %s, which has already finished — forwarded here instead] %s", m.OrigTo.ID, text)
+		}
+		if m.Kind == bus.KindAskReply {
+			// The reply already carries its own tyci-notice tag.
+			out = append(out, text)
+			continue
 		}
 		out = append(out, tagSender(m, text))
 	}
@@ -326,16 +285,25 @@ func noticeText(m bus.Message) (text string, ok bool) {
 			return btwSuggestionNotice(a.Question, a.JobID, a.Text), true
 		}
 		return btwEvaluationNotice(a.Question, a.JobID, a.Text), true
+	case bus.KindAskReply:
+		a, err := bus.Decode[bus.AskReply](m)
+		if err != nil {
+			fmt.Fprintf(busLog, "bus: ask reply %d not read: %v\n", m.Seq, err)
+			return "", false
+		}
+		// The answer is data from the parent. A closing tag in it is escaped,
+		// so it cannot end the notice early (see agent/late_notice.go).
+		answer := strings.ReplaceAll(a.Answer, "</tyci-notice", `<\/tyci-notice`)
+		return fmt.Sprintf("<tyci-notice kind=ask.reply id=%s from=agent>%s</tyci-notice>", a.Question, answer), true
 	case bus.KindAskRequest:
 		a, err := bus.Decode[bus.AskRequest](m)
 		if err != nil {
 			fmt.Fprintf(busLog, "bus: ask %d not read: %v\n", m.Seq, err)
 			return "", false
 		}
-		if takeShownAsk(a.Agent, a.QuestionSeq) {
-			return "", false
-		}
-		return a.Text, true
+		return fmt.Sprintf("[background job] %s asks: %q (job_id=%s, question id=q%d)\n"+
+			"Answer it with answer_job(job_id=%q, text=\"...\") only if you genuinely know it or the user told you. The child does not block on the question.",
+			a.Agent, a.Question, a.Agent, m.Seq, fmt.Sprintf("q%d", m.Seq)), true
 	}
 	fmt.Fprintf(busLog, "bus: message %d of kind %q not shown\n", m.Seq, m.Kind)
 	return "", false
@@ -505,11 +473,6 @@ func (noticeCounter) Queued() uint64 {
 	return busOrchestratorNotices.Accepted()
 }
 
-// MarkAskShown records a handoff message's question. See markAskShown.
-func (noticeCounter) MarkAskShown(jobID string, seq int) {
-	markAskShown(jobID, seq)
-}
-
 // watchdogNotify sends a watchdog alarm to the agent to, or to the human when
 // to is "". It reports false when to is not live, so that the watchdog climbs
 // to the next ancestor. The bus would otherwise reroute the alarm to the
@@ -552,7 +515,6 @@ func jobStatusOf(j jobs.Job) bus.JobStatus {
 		Progress:     j.Progress,
 		Result:       j.Result,
 		Err:          j.Err,
-		Question:     j.Question,
 		Started:      j.StartedAt,
 		Ended:        j.FinishedAt,
 		LastActivity: j.LastActivity,
