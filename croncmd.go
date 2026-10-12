@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/crazy-goat/tyci-agent/internal/cron"
+	"github.com/crazy-goat/tyci-agent/internal/gitinfo"
 	"github.com/crazy-goat/tyci-agent/internal/trust"
 	"github.com/crazy-goat/tyci-agent/session"
 	"github.com/spf13/cobra"
@@ -141,7 +142,7 @@ func cronDirs(wd string) ([]string, error) {
 	// Project-local configuration is rooted at the repository/project root,
 	// not the caller's current subdirectory. This keeps `tyci cron` aligned
 	// with trust and session project semantics when invoked from repo/subdir.
-	return []string{global, filepath.Join(root, ".tyci")}, nil
+	return []string{global, filepath.Dir(gitinfo.ProjectPath(wd, "cron.json"))}, nil
 }
 
 func loadCronFile(wd string) (*cron.File, []string, error) {

@@ -14,6 +14,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/crazy-goat/tyci-agent/internal/gitinfo"
 )
 
 const defaultCheckTimeout = 1800 * time.Second
@@ -149,7 +151,7 @@ func Load(home, projectDir string, trusted bool) (*Config, error) {
 		return nil, err
 	}
 	if trusted {
-		proj, err := readFile(filepath.Join(projectDir, ".tyci", "config.json"))
+		proj, err := readFile(gitinfo.ProjectPath(projectDir, "config.json"))
 		if err != nil {
 			return nil, err
 		}

@@ -17,6 +17,7 @@ import (
 	"github.com/crazy-goat/tyci-agent/internal/cron"
 	"github.com/crazy-goat/tyci-agent/internal/debug"
 	"github.com/crazy-goat/tyci-agent/internal/flow"
+	"github.com/crazy-goat/tyci-agent/internal/gitinfo"
 	"github.com/crazy-goat/tyci-agent/internal/hooks"
 	"github.com/crazy-goat/tyci-agent/internal/pricing"
 	"github.com/crazy-goat/tyci-agent/internal/readline"
@@ -146,7 +147,7 @@ func setupProjectLocalEnv(ctx context.Context, wd string, trusted, connectMCP, n
 	// ones (~/.tyci/tools) are already loaded unconditionally by the tools
 	// package's own init() (see tools.LoadAndRegisterLuaTools).
 	if trusted {
-		tools.LoadAndRegisterLocalLuaTools(filepath.Join(wd, ".tyci", "tools"))
+		tools.LoadAndRegisterLocalLuaTools(gitinfo.ProjectPath(wd, "tools"))
 	}
 
 	// Project-local cron.json (TODO.md item 22) — same trust gate: a
@@ -157,7 +158,7 @@ func setupProjectLocalEnv(ctx context.Context, wd string, trusted, connectMCP, n
 	// SetBackgroundBashEnabled/SetJobStarter use) rather than decided again
 	// inside tools/cron.go.
 	if trusted {
-		tools.SetLocalCronDir(filepath.Join(wd, ".tyci"))
+		tools.SetLocalCronDir(filepath.Dir(gitinfo.ProjectPath(wd, "cron.json")))
 	} else {
 		tools.SetLocalCronDir("")
 	}

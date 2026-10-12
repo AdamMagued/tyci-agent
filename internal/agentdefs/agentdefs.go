@@ -11,8 +11,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/crazy-goat/tyci-agent/internal/gitinfo"
 	"gopkg.in/yaml.v3"
+
+	"github.com/crazy-goat/tyci-agent/internal/gitinfo"
 )
 
 // Def is a fully parsed markdown agent definition.
@@ -123,12 +124,7 @@ func ProjectDir(wd string) string {
 	if wd == "" {
 		wd, _ = os.Getwd()
 	}
-	if root := gitinfo.ProjectRoot(wd); root != "" {
-		wd = root
-	} else if abs, err := filepath.Abs(wd); err == nil {
-		wd = abs
-	}
-	return filepath.Join(wd, ".tyci", "agents")
+	return gitinfo.ProjectPath(wd, "agents")
 }
 
 // Dirs returns the ordered list of directories to load agent definitions

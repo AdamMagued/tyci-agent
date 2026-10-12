@@ -39,6 +39,8 @@ import (
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
+
+	"github.com/crazy-goat/tyci-agent/internal/gitinfo"
 )
 
 const (
@@ -217,10 +219,7 @@ func Load(paths ...string) []error {
 // protection the user configured for themselves.
 func DefaultPaths(projectDir string) []string {
 	paths := []string{filepath.Join(os.Getenv("HOME"), ".tyci", "hooks.json")}
-	if projectDir == "" {
-		projectDir = "."
-	}
-	return append(paths, filepath.Join(projectDir, ".tyci", "hooks.json"))
+	return append(paths, gitinfo.ProjectPath(projectDir, "hooks.json"))
 }
 
 // SetForTesting installs hooks directly and returns a function restoring the
@@ -394,6 +393,7 @@ func hookEnv(p payload) []string {
 	env := []string{
 		"TYCI_HOOK_EVENT=" + p.Event,
 		"TYCI_TOOL=" + p.Tool,
+		"TYCI_PROJECT_DIR=" + gitinfo.ProjectDir("."),
 	}
 	if path, ok := p.Args["path"].(string); ok {
 		env = append(env, "TYCI_TOOL_PATH="+path)

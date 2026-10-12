@@ -27,6 +27,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/crazy-goat/tyci-agent/internal/gitinfo"
 )
 
 var ErrValidation = errors.New("invalid memory note input")
@@ -167,7 +169,7 @@ func displayPath(cwd, path string) string {
 
 // MemoryDir returns the notes directory for a project root.
 func MemoryDir(cwd string) string {
-	return filepath.Join(cwd, MemoryDirName)
+	return gitinfo.ProjectPath(cwd, "memory")
 }
 
 // SanitizeName turns a requested note name into a safe file stem, or returns

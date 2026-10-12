@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/crazy-goat/tyci-agent/internal/gitinfo"
 )
 
 // Skill represents a loaded skill with metadata and content.
@@ -34,7 +36,7 @@ func ProjectDir(wd string) string {
 	if wd == "" {
 		wd, _ = os.Getwd()
 	}
-	return filepath.Join(wd, ".tyci", "skills")
+	return gitinfo.ProjectPath(wd, "skills")
 }
 
 // Dirs returns the ordered list of directories to load skills from: global
