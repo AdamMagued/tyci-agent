@@ -1,8 +1,7 @@
 package flow
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,7 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -22,16 +21,62 @@ const stateFile = "state.json"
 // Store writes RunState to <Dir>/state.json atomically.
 type Store struct{ Dir string }
 
-// NewRunID returns the run id YYYYMMDD-HHMMSS-<issue> (UTC). A run without an
-// issue (issue 0) gets a random suffix, so two such runs in one second differ.
-func NewRunID(issue int, now time.Time) string {
-	id := now.UTC().Format("20060102-150405") + "-" + strconv.Itoa(issue)
-	if issue > 0 {
-		return id
+// runCounterFile holds the last run number of a repository. It lives in the
+// runs dir of the repository, next to the run dirs.
+const runCounterFile = "counter"
+
+// NewRunID reserves the next run number of repository repoName and returns it
+// as the run id, for example "17". The number is kept in runCounterFile under the
+// runs lock, so parallel starts get different numbers, and a number is never
+// reused, even after its run dir is deleted. A missing counter starts after the
+// highest existing run number.
+func NewRunID(home, repoName string) (string, error) {
+	base := filepath.Join(home, ".tyci", "runs", repoName)
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		return "", err
 	}
-	var b [3]byte
-	_, _ = rand.Read(b[:]) // crypto/rand does not fail on supported platforms
-	return id + "-" + hex.EncodeToString(b[:])
+	unlock, err := lockRun(base)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	path := filepath.Join(base, runCounterFile)
+	last, err := readRunCounter(path, base)
+	if err != nil {
+		return "", err
+	}
+	next := last + 1
+	if err := os.WriteFile(path, []byte(strconv.Itoa(next)+"\n"), 0o600); err != nil {
+		return "", err
+	}
+	return strconv.Itoa(next), nil
+}
+
+// readRunCounter returns the last run number in path. When path does not exist,
+// it returns the highest numeric run dir in base, or 0.
+func readRunCounter(path, base string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err == nil {
+		n, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil {
+			return 0, fmt.Errorf("flow: bad run counter %s: %w", path, err)
+		}
+		return n, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return 0, err
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return 0, err
+	}
+	highest := 0
+	for _, e := range entries {
+		if n, err := strconv.Atoi(e.Name()); e.IsDir() && err == nil && n > highest {
+			highest = n
+		}
+	}
+	return highest, nil
 }
 
 // RunDir returns <home>/.tyci/runs/<repo>/<run>.
@@ -49,8 +94,8 @@ func StatePath(runDir string) string {
 // repository or more than one repository has the run.
 func FindRun(home, runID string) (*RunState, string, error) {
 	var matches []string
-	if runIDPattern.MatchString(runID) {
-		matches, _ = filepath.Glob(StatePath(RunDir(home, "*", runID)))
+	if id, ok := ParseRunID(runID); ok {
+		matches, _ = filepath.Glob(StatePath(RunDir(home, "*", id)))
 	}
 	switch len(matches) {
 	case 0:
@@ -59,7 +104,7 @@ func FindRun(home, runID string) (*RunState, string, error) {
 		st, err := Load(filepath.Dir(matches[0]))
 		return st, matches[0], err
 	default:
-		return nil, "", fmt.Errorf("run id is ambiguous: %s", strings.Join(matches, ", "))
+		return nil, "", fmt.Errorf("run %s is in more than one repository, so it is ambiguous; these state files match: %s", ShowRunID(runID), strings.Join(matches, ", "))
 	}
 }
 
@@ -150,29 +195,48 @@ func Load(dir string) (*RunState, error) {
 	return &st, nil
 }
 
-// LatestRun returns the newest run directory of a repo (names start with a
-// timestamp, so string order is time order).
+// LatestRun returns the newest run directory of a repo. See runDirsNewestFirst
+// for the order.
 func LatestRun(home, repoName string) (string, error) {
-	base := filepath.Join(home, ".tyci", "runs", repoName)
-	entries, err := os.ReadDir(base)
-	if err != nil {
-		return "", fmt.Errorf("flow: no runs: %w", err)
-	}
-	var names []string
-	for _, e := range entries {
-		if e.IsDir() {
-			names = append(names, e.Name())
-		}
-	}
+	base, names := runDirsNewestFirst(home, repoName)
 	if len(names) == 0 {
 		return "", fmt.Errorf("flow: no runs in %s", base)
 	}
-	sort.Strings(names)
-	return filepath.Join(base, names[len(names)-1]), nil
+	return filepath.Join(base, names[0]), nil
+}
+
+// newerRunFirst orders run dir names newest first. Run numbers compare by value
+// and come before old ids, which are timestamps (YYYYMMDD-HHMMSS-<issue>) and
+// compare as strings.
+func newerRunFirst(a, b string) int {
+	na, aNum := runNumber(a)
+	nb, bNum := runNumber(b)
+	switch {
+	case aNum && bNum:
+		return cmp.Compare(nb, na)
+	case aNum != bNum:
+		if aNum {
+			return -1
+		}
+		return 1
+	default:
+		return cmp.Compare(b, a)
+	}
+}
+
+// runNumber returns the number of a run number name, such as "17". ok is false
+// for an old id.
+func runNumber(name string) (n int, ok bool) {
+	if !runNumberPattern.MatchString(name) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(name)
+	return n, err == nil
 }
 
 // runDirsNewestFirst returns the names of the run directories of a repo, newest
-// first. A missing repo directory gives no names.
+// first: run numbers by value, then old ids by their timestamp. A missing repo
+// directory gives no names.
 func runDirsNewestFirst(home, repoName string) (base string, names []string) {
 	base = filepath.Join(home, ".tyci", "runs", repoName)
 	entries, err := os.ReadDir(base)
@@ -184,7 +248,7 @@ func runDirsNewestFirst(home, repoName string) (base string, names []string) {
 			names = append(names, e.Name())
 		}
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	slices.SortFunc(names, newerRunFirst)
 	return base, names
 }
 
@@ -255,7 +319,7 @@ func ListRuns(home, repoName string, archived bool, limit, offset int) (RunList,
 	end := min(start+limit, len(all))
 	out := RunList{Runs: []RunRow{}, Total: len(all), Offset: offset, Limit: limit, More: end < len(all)}
 	for _, st := range all[start:end] {
-		out.Runs = append(out.Runs, RunRow{Run: st.Run, Workflow: st.Workflow, Params: st.Params,
+		out.Runs = append(out.Runs, RunRow{Run: ShowRunID(st.Run), Workflow: st.Workflow, Params: st.Params,
 			Status: st.Status, State: st.Current, StartedAt: st.StartedAt})
 	}
 	return out, nil
@@ -266,10 +330,11 @@ func ListRuns(home, repoName string, archived bool, limit, offset int) (RunList,
 // the run path is not a directory. err is set when the state file exists but
 // cannot be read.
 func RunByID(home, repoName, runID string) (st *RunState, ok bool, err error) {
-	if !runIDPattern.MatchString(runID) {
+	id, ok := ParseRunID(runID)
+	if !ok {
 		return nil, false, nil
 	}
-	st, err = Load(filepath.Join(home, ".tyci", "runs", repoName, runID))
+	st, err = Load(filepath.Join(home, ".tyci", "runs", repoName, id))
 	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		return nil, false, nil
 	}
