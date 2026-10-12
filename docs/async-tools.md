@@ -68,9 +68,9 @@ returns only when it finishes or when the turn is cancelled. A serial tool
 therefore keeps the order of its batch.
 
 The dispatcher never backgrounds `subagent`, `ask_parent` or `wait`. The
-`subagent` tool still has its own 60s handoff (`runWithHandoff` in
-`tools/subagent.go`). That handoff stays until the cleanup follow-up removes
-it.
+`subagent` tool has no handoff of its own. It blocks until its children finish,
+or until its context ends. Then the children that still run are cancelled
+(`runBlocking` in `tools/subagent.go`).
 
 ## Background wait and kill deadline
 
@@ -129,11 +129,19 @@ arrives. The jobs are not touched in either case.
 
 `ids` and `job_id` also accept call ids (see "Call ids").
 
-The `kinds` input is accepted and checked: only `ask.reply` is allowed. It does not
-filter the notices yet. A wait wakes on any new notice.
+The `kinds` input accepts only `ask.reply`. With `kinds`, the wait wakes only on
+a new notice of that kind. Notices of other kinds do not end the wait. A wait
+without `kinds` wakes on any new notice.
 
-Not implemented: a `kinds` filter for notices, and a `Seq` based dedupe. The
-wait path dedupes by job id only.
+The main conversation has no `ask_parent`, so `kinds=["ask.reply"]` never wakes
+the main agent. Its wait then ends only at `seconds`, or on a pending user
+message or a job it waits for. Use `kinds` only in a subagent.
+
+Repeated ids count once. The dedupe runs after call ids are resolved, so `c3`
+and its job id count as one job.
+
+Not implemented: a dedupe of notices by `Seq`. `wait` does not read a notice
+list; it wakes on a count of new notices, and the bus stores each message once.
 
 ## Mutation FIFO
 
@@ -186,6 +194,11 @@ call context that ends does not release the lock.
 
 ## Known gaps
 
+- A dedupe of notices by `Seq` is not implemented. `wait` has no notice list to
+  dedupe; it wakes on a count of new notices (see "Wait tool").
+- The full output of a late tool result in a workflow run is not written to
+  `<run dir>/tool-results/`. It goes only to `~/.tyci/tool-results/<session-id>`
+  (`agent/result_tail.go`). Open follow-up of #651.
 - `subagent` blocks by design. `ask_parent` returns at once (#200). Its
   question id and route are kept in memory, so an answer after a restart of
   tyci fails.
@@ -196,5 +209,3 @@ call context that ends does not release the lock.
   `agent/agent.go` is false there). The notice stays queued for the next turn. If no
   later turn follows, the result is lost.
 - Call ids restart at `c1` after a resume (see "Call ids").
-- `runWithHandoff`, `watchForWaiting`, the bash `background_after` timer,
-  `SetJobObserver` and `AskUnroutableCtxKey` still exist. See #651.

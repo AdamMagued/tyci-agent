@@ -171,6 +171,21 @@ func publishNotice(b *bus.Bus, parentID, text string, quiet bool) {
 		bus.Completion{Text: text, Quiet: quiet})
 }
 
+// busKindWatch implements tools.NoticeKindWatch. An answer to a question is
+// sent to the inbox of the asking job (see jobAnswererAdapter), so the watch
+// subscribes to that inbox for the kinds only.
+func busKindWatch(callerJobID string, kinds []string) (arrived func() bool, stop func()) {
+	bk := make([]bus.Kind, 0, len(kinds))
+	for _, k := range kinds {
+		bk = append(bk, bus.Kind(k))
+	}
+	sub := appBus.Subscribe("wait kinds "+callerJobID, bus.Filter{To: agentAddr(callerJobID), Kinds: bk})
+	// stop drains the watch too. The watch is a receiver, so a message that
+	// stays queued in it would keep its state at Sent (see #578). The
+	// messages are dropped: the job inbox still holds them for the agent.
+	return func() bool { return sub.Accepted() > 0 }, func() { sub.CloseAndDrain() }
+}
+
 // publishAsk sends question of agent agentID to parentID, or to the
 // orchestrator when parentID is "". The bus reroutes it to the orchestrator
 // when parentID has finished. It returns the bus Seq of the question, which
