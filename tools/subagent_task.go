@@ -37,6 +37,18 @@ type TaskSpec struct {
 	// OnDone, when set, receives the usage of the run after it ends (also
 	// after an error). The workflow runner stores it in the run history.
 	OnDone func(TaskStats)
+	// Policy, when set, is the tool policy of a workflow role (see Policy).
+	// It restricts the tools and the write paths of the run.
+	Policy *Policy
+	// Fallbacks are the provider URIs tried, in order, when Model fails.
+	Fallbacks []string
+	// RoleLimits is true when the role sets rounds or time_min. A run that
+	// stops on one of them returns an error that wraps ErrSubagentTruncated
+	// or ErrSubagentTimedOut, so the workflow can take its "limit" key.
+	RoleLimits bool
+	// MaxRounds, when > 0, caps the tool-call rounds of the run. A run that
+	// reaches the cap returns ErrSubagentTruncated.
+	MaxRounds int
 }
 
 // TaskStats is what a finished subagent run reports: the model it used and
@@ -129,6 +141,12 @@ func runSubagentTask(ctx context.Context, runner SubAgentRunner, s TaskSpec) (st
 		ctx = context.WithValue(ctx, TranscriptCtxKey{}, s.Transcript)
 	}
 	t := subagentTask{Task: s.Task, Model: s.Model, systemPrompt: s.SystemPrompt, softLimit: s.SoftLimit, hardLimit: s.HardLimit, effort: s.Effort}
+	t.fallbacks = s.Fallbacks
+	t.maxIterationsCap = s.MaxRounds
+	if s.Policy != nil {
+		ctx = WithPolicy(ctx, *s.Policy)
+		t.toolsOverride = s.Policy.ToolNames()
+	}
 	if s.MaxIterations > 0 {
 		t.MaxIterations = &s.MaxIterations
 	}
@@ -140,6 +158,13 @@ func runSubagentTask(ctx context.Context, runner SubAgentRunner, s TaskSpec) (st
 	res := runSingleTask(WithWorkdir(ctx, s.Dir), runner, t, 0, false)
 	if s.OnDone != nil {
 		s.OnDone(TaskStats{Model: res.Model, Usage: res.Usage, Turns: res.Turns, ToolCalls: res.ToolCalls})
+	}
+	if s.RoleLimits && res.limitErr != nil {
+		msg := res.Error
+		if msg == "" {
+			msg = "the run stopped on a role limit"
+		}
+		return res.Content, id, fmt.Errorf("%w: %s", res.limitErr, msg)
 	}
 	if !res.Success {
 		return res.Content, id, errors.New(res.Error)

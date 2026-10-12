@@ -3,6 +3,8 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -47,6 +49,18 @@ func TestRunSubagentTask_PassesCompactLimits(t *testing.T) {
 	}
 	if r.gotOpts.SoftLimit != 100000 || r.gotOpts.HardLimit != 150000 {
 		t.Fatalf("opts limits = %d, %d", r.gotOpts.SoftLimit, r.gotOpts.HardLimit)
+	}
+}
+
+// #201: the role fallbacks in TaskSpec reach the child options.
+func TestRunSubagentTask_PassesFallbacks(t *testing.T) {
+	r := &recordingRunner{}
+	fbs := []string{"openai/gpt-x", "anthropic/claude-y"}
+	if _, _, err := runSubagentTask(context.Background(), r, TaskSpec{Task: "x", Fallbacks: fbs}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(r.gotOpts.Fallbacks, ",") != strings.Join(fbs, ",") {
+		t.Fatalf("opts fallbacks = %v", r.gotOpts.Fallbacks)
 	}
 }
 
@@ -198,5 +212,54 @@ func TestRunSubagentTask_NamedJobPanicIsError(t *testing.T) {
 	subagentToolInstance = &SubagentTool{Runner: run}
 	if _, _, err := RunSubagentTask(context.Background(), TaskSpec{Task: "x", Name: "run/worker"}); err == nil {
 		t.Fatal("want an error after a panic in the role agent")
+	}
+}
+
+// #201: the role rounds limit in TaskSpec reaches the child options.
+func TestRunSubagentTask_PassesMaxRounds(t *testing.T) {
+	r := &recordingRunner{}
+	if _, _, err := runSubagentTask(context.Background(), r, TaskSpec{Task: "x", MaxRounds: 9}); err != nil {
+		t.Fatal(err)
+	}
+	if r.gotOpts.MaxIterationsCap != 9 {
+		t.Fatalf("MaxIterationsCap = %d, want 9", r.gotOpts.MaxIterationsCap)
+	}
+}
+
+// #201: a run that stops on a role limit reports the limit sentinel through
+// runSubagentTask, with or without text, so the workflow takes "limit".
+func TestRunSubagentTask_RoleLimitKeepsSentinel(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		err  error
+		want error
+	}{
+		{"rounds with text", "partial", fmt.Errorf("%w: cap", ErrSubagentTruncated), ErrSubagentTruncated},
+		{"rounds without text", "", ErrSubagentTruncated, ErrSubagentTruncated},
+		{"time with text", "partial", fmt.Errorf("%w: deadline", ErrSubagentTimedOut), ErrSubagentTimedOut},
+		{"time without text", "", fmt.Errorf("%w: deadline", ErrSubagentTimedOut), ErrSubagentTimedOut},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &recordingRunner{returnResult: tc.text, returnErr: tc.err}
+			out, _, err := runSubagentTask(context.Background(), r, TaskSpec{Task: "x", RoleLimits: true})
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			if out != tc.text {
+				t.Fatalf("content = %q, want %q", out, tc.text)
+			}
+		})
+	}
+}
+
+// Callers without role limits keep the old behaviour: a truncated run with
+// text is a success.
+func TestRunSubagentTask_NoRoleLimitUnchanged(t *testing.T) {
+	r := &recordingRunner{returnResult: "partial", returnErr: ErrSubagentTruncated}
+	out, _, err := runSubagentTask(context.Background(), r, TaskSpec{Task: "x"})
+	if err != nil || out != "partial" {
+		t.Fatalf("out=%q err=%v, want partial and nil", out, err)
 	}
 }
