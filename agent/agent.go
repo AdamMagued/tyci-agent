@@ -35,6 +35,11 @@ type Config struct {
 	Schema        json.RawMessage
 	Session       *session.Session // optional session logging / resume
 
+	// Dispatch runs the tool calls of this conversation through the bus (see
+	// NewDispatcher). It outlives one Run, so a late result is taken by the
+	// next one. Nil keeps the inline behaviour. The owner closes it.
+	Dispatch *Dispatcher
+
 	// Temperature, when non-nil, is forwarded on every connector.Request this
 	// run issues — to the primary model and, if it fails, to every fallback in
 	// turn (see runOnce and tryFallback below: both read cfg.Temperature, and
@@ -219,6 +224,13 @@ func Run(ctx context.Context, mc connector.ModelClient, d Sink, msgs *[]connecto
 	if cfg.MaxRetries == 0 {
 		cfg.MaxRetries = 5
 	}
+	// ESC (a cancelled ctx) stops the background calls too. A normal end of
+	// the turn does not cancel them: their results come in a later turn.
+	defer func() {
+		if ctx.Err() != nil {
+			cfg.Dispatch.cancelBackground()
+		}
+	}()
 
 	var totalUsage stream.Usage
 
@@ -472,6 +484,12 @@ func Run(ctx context.Context, mc connector.ModelClient, d Sink, msgs *[]connecto
 				}
 			}
 		}
+		if canDrain && cfg.Dispatch != nil {
+			if late := cfg.Dispatch.takeLate(); len(late) > 0 {
+				appendLateNotices(msgs, cfg, late)
+				drained = true
+			}
+		}
 		// A real user follow-up starts a fresh sub-task; reset the reminder
 		// budget so we're willing to nag again about whatever it leaves open.
 		if drained {
@@ -508,6 +526,14 @@ func Run(ctx context.Context, mc connector.ModelClient, d Sink, msgs *[]connecto
 				contextReminded = true
 				reminder := buildContextBudgetReminder(used, hardAt, false)
 				*msgs = append(*msgs, connector.Message{Role: "user", Content: []connector.ContentBlock{{Type: "text", Text: reminder}}})
+			}
+		}
+		// The model ended its turn while calls still run. Wait for their
+		// results, so that the model sees them before the turn ends.
+		if !more && !drained && canDrain && cfg.Dispatch != nil && cfg.Dispatch.Pending() > 0 {
+			if late := cfg.Dispatch.waitLate(ctx); len(late) > 0 {
+				appendLateNotices(msgs, cfg, late)
+				drained = true
 			}
 		}
 		if !more && !drained {
